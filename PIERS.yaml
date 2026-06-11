@@ -1,0 +1,7 @@
+image: /home/hello-robot/AssistiveStretchVoice-main/src/turtlebot4_voice_control/turtlebot4_voice_control/PIERS.pgm
+mode: trinary
+resolution: 0.05
+origin: [-4.48, -6.29, 0]
+negate: 0
+occupied_thresh: 0.65
+free_thresh: 0.25
