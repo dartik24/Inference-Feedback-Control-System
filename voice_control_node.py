@@ -173,6 +173,8 @@ class VoiceControlNode(Node):
         # self.waiting_music = '/home/hello-robot/Downloads/Waiting.mp3'
         self.music_volume = 0.5  
         self.speaking = False
+        self.speak_lock = Lock()
+        self.state_lock = Lock()
 
         # Companion App
         self.actions = []
@@ -219,21 +221,18 @@ class VoiceControlNode(Node):
     # Updates action list to remove the first one and update the remaining ones accordingly.
     def update_action(self):
         with actions_lock:
-            del self.actions[0]
-        for i in self.actions:
-            i = [{
-            "id" : i["id"],
-            "pos" : i["pos"] - 1,
-            "tnum" : i["tnum"],
-            "name" : i["name"],
-            "status" : "ongoing" if i == self.actions[0] else "pending",
-            "destination" : i["destination"],
-            "phase" : i["phase"], 
-            "started_at" : None
-            }]
-        print(self.actions)
+            if not self.actions:
+                self.sync_actions_for_http()
+                return
+
+            self.actions.pop(0)
+
+            for idx, action in enumerate(self.actions):
+                action["pos"] = idx + 1
+                action["status"] = "ongoing" if idx == 0 else "pending"
+                action["started_at"] = None
+
         self.sync_actions_for_http()
-        print("Sync done")
 
     # Fetches ids for every action from first to last
     def _queued_action_ids_in_order(self):
@@ -277,7 +276,7 @@ class VoiceControlNode(Node):
 
             for t in pending:
                 if t[2] in ids:
-                    new_pending.append(ids.pop(t[2]))
+                    npending.append(ids.pop(t[2]))
 
             for task in npending:
                 self.task_queue.put(task)
@@ -382,10 +381,21 @@ class VoiceControlNode(Node):
         subcommands = self.command_interpretation(command)
         if subcommands:
             for subcommand in subcommands:
-                targets = subcommand.split(",")
+                targets = [x.strip() for x in subcommand.split(",")]
+                task_type, task_dest, task_id = targets
+
                 if len(targets) > 3:
-                    self.speak("I dont think I got that, could you say that again?") 
-                self.add_task_to_queue((targets[0], targets[1]))
+                    self.speak("I dint fully understand, could you say that again?") 
+
+                if task_type not in ["go", "wait", "grab"]:
+                    self.speak("I did not understand that action.")
+                    continue
+
+                if  not hasattr(self, task_dest):
+                    self.speak(f"I do not know the location {task_dest}.")
+                    continue
+
+                self.add_task_to_queue((task_type, task_dest))
 
     # Voice command interpretation
     # Edit 1: after initial interpretation now sets a flag through the splitter variable and if ran with flag set will enter confirmation mode. Confirmation mode will instead request a response and distinguish between it being a confirmation clarification or rejection. 
@@ -413,7 +423,7 @@ class VoiceControlNode(Node):
             if self.splitter[0]:
                 tg = 0
                 self.splitter[0] = self.splitter[0].split(" then ")
-                while self.addactcount is not 0:
+                while self.addactcount != 0:
                     self.actions.pop()
                     self.addactcount = self.addactcount - 1
                     self.actionnum = self.actionnum - 1
@@ -451,11 +461,11 @@ class VoiceControlNode(Node):
                 print(list(ret))
                 return ret
             elif completion.choices[0].message.content == "Clarification" or completion.choices[0].message.content == "clarification":
-                full_command = self.comm + command
+                full_command = self.comm + " " + command
                 self.splitter = None
                 return self.command_interpretation(full_command)
             else:
-                while self.addactcount is not 0:
+                while self.addactcount != 0:
                     self.actions.pop()
                     self.addactcount = self.addactcount - 1
                     self.actionnum = self.actionnum - 1
@@ -470,7 +480,12 @@ class VoiceControlNode(Node):
     # Universal halt to all activity and queue clear
     def stop_all_tasks(self):
         # self.fade_out_and_stop_music()
-        self.task_queue.queue.clear()
+        with self.task_queue_lock:
+            while not self.task_queue.empty():
+                try:
+                    self.task_queue.get_nowait()
+                except Exception:
+                    break
         self.is_navigating = False
         self.current_task = None
         self.addactcount = 0
@@ -517,8 +532,7 @@ class VoiceControlNode(Node):
     def process_task_queue(self):
         while rclpy.ok():
             if not self.is_navigating and not self.task_queue.empty():
-                with self.task_queue_lock:
-                    task = self.task_queue.get()
+                task = self.task_queue.get()
                     
                 task_type, task_dest, task_id = task
                 print(task_type)
@@ -537,6 +551,8 @@ class VoiceControlNode(Node):
                     print("DONE WITH GRAB")
                 elif task_type == "follow":
                     self.follow_to(getattr(self, task_dest, "Room not found")[0], getattr(self, task_dest, "Room not found")[1])
+            else:
+                time.sleep(0.1)
 
     def grab(self, target):
         print("TIMEOUT")
@@ -740,8 +756,6 @@ class VoiceControlNode(Node):
         self.get_logger().info(f"Distance to goal: {distance_to_goal:.2f} meters")
 
         return distance_to_goal < self.goal_threshold
-
-        return distance_to_goal < self.goal_threshold
     
     # Pygame music enabler with fade in
     def play_music_with_fade_in(self, music_file):
@@ -772,6 +786,7 @@ class VoiceControlNode(Node):
             self.get_logger().info('Goal was rejected.')
             self.speak("Navigation goal was rejected.")
             self.is_navigating = False
+            self.update_action()
             return
 
         self.current_goal_handle = goal_handle
@@ -805,11 +820,14 @@ class VoiceControlNode(Node):
 
     # Audio output enabler
     def speak(self, text):
-        self.speaking = True
-        self.get_logger().info(f'Speaking: {text}')
-        self.text_to_speech(text)
-        time.sleep(0.2)
-        self.speaking = False
+        with self.speak_lock:
+            self.speaking = True
+            try:
+                self.get_logger().info(f'Speaking: {text}')
+                self.text_to_speech(text)
+                time.sleep(0.2)
+            finally:
+                self.speaking = False
 
     # Audio feedback enabler
     def text_to_speech(self, text):
@@ -824,9 +842,8 @@ class VoiceControlNode(Node):
             audio = audio.set_channels(1).set_frame_rate(22050).set_sample_width(2)
             raw = audio.raw_data
 
-            with threading.Lock():
-                play = sa.play_buffer(raw, num_channels=1, bytes_per_sample=2, sample_rate=22050)
-                play.wait_done()
+            play = sa.play_buffer(raw, num_channels=1, bytes_per_sample=2, sample_rate=22050)
+            play.wait_done()
 
             del audio
             mp3_fp.close()
