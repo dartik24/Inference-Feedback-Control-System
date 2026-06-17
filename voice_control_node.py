@@ -143,12 +143,7 @@ class VoiceControlNode(Node):
                 + json.dumps(json.load(f), indent=2)
                 + "\n\nIMPORTANT: Your response must consist of exactly one label and nothing else."
             )
-        # "You are a voice request interpreter. Your role is to interpret any user input and convert it into a sequence of commands using only the following commands: go, wait, and the following locations: kitchen, livingroom, bedroom. Always assume the following world state: a warm blanket is in the bedroom and must be delivered to the livingroom; a dirty plate is in the livingroom and must be delivered to the kitchen; a full cup of coffee is in the kitchen and must be delivered to the bedroom; a full glass of water is in the livingroom and must be delivered to the kitchen. Task rules: perform only one object delivery task per output unless explicitly instructed otherwise, avoid repeating locations unnecessarily, assume movement is required before interacting with an object, do not include explanations or extra text, and the output must be a single string. Output format is strict: the output must be one string containing two parts—(1) a command sequence where each command is formatted as command,location and all commands are on one line separated by the word ' then ', and (2) a confirmation section appended after the command sequence separated by a newline character (\\n). The confirmation section must be a request for confirmation and must clearly state the overall task being performed. Example output format: \"go,bedroom then go,livingroom then wait,livingroom\\nPlease confirm that you want me to deliver the warm blanket from the bedroom to the livingroom.\""
-
-        # You are a voice request interpreter. Your job is to interpret any input as one of these commands: [go, wait]. And to one of these locations: [kitchen, livingroom, bedroom]. Always format your response like this: command1,location1 then command2,location2 then command3,location3 then etc (new line with the confirmation section content) Always assume: - A warm blanket is in the bedroom and needs to get to the livingroom. - A dirty plate is in the livingroom and needs to get to the kitchen. - A full cup of coffee is in the kitchen and needs to get to the bedroom. -A full glass of water in the livingroom and needs to get to the kitchen. Avoid repeating locations unnecessarily. Always an additional confirmation section to the output on a new line. Always make the confirmation section be a request for confirmation of the task at hand. Always mention what the overall task at hand is. Try to limit to one object delivery task per output unless otherwise requested.
-
-        # Your job is to interpret the provided input as confirmation or clarification, a confirmation is if the input is a direct agreement with a previous request, a clarification is if the user does not provide direct agreement or adds new details. Reply simple with one word, confirmation or clarification.    
-
+       
         # Preset Locations
         for room, coords in self.config["locations"].items():
             setattr(self, room, coords)
@@ -501,19 +496,6 @@ class VoiceControlNode(Node):
         self.sync_actions_for_http()
         # self.speak("Task added to the queue.")
 
-    # def task_queue_update(self):
-    #     updated = []
-    #     while True:
-    #         try:
-    #             task, dest, aid = self.task_queue.get_nowait()
-    #         except Exception:
-    #             break
-
-    #         updated.append((task, dest, aid - 1))
-
-    #     for item in updated:
-    #         self.task_queue.put(item)
-
     # Command execution off the top of the queue
     def process_task_queue(self):
         while rclpy.ok():
@@ -799,8 +781,6 @@ class VoiceControlNode(Node):
             self.get_logger().info('Navigation goal failed.')
             self.speak(f"I could not reach the {self.destination}.")
         self.update_action()
-        # self.task_queue_update()
-        # self.actionnum = self.actionnum - 1
         self.is_navigating = False
         self.current_goal_handle = None
 
@@ -869,9 +849,6 @@ def create_app() -> FastAPI:
             return {"status": "error", "reason": "ROS node not ready"}
         ROS_NODE.reorder_tasks(update.order)
         return {"status": "ok"}
-
-    # def root():
-    #     return {"status": "ok", "routes": [route.path for route in app.routes]}
 
     return app
 
