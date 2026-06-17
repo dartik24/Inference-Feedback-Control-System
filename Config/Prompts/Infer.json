@@ -33,6 +33,8 @@
   },
 
   "rules": {
+    "provide_a_plan_even_if_request_is_unclear": true,
+    "assume_that_the_user_always_reffers_to_something_in_the_world_state": true,
     "user_information_overrides_world_state": true,
     "move_before_interacting_with_objects": true,
     "move_to_delivery_location_after_grab": true,
@@ -42,10 +44,13 @@
   },
 
   "output_format": {
-    "command_format": "command,location_or_object,id",
+    "ALWAYS_FOLLOW_OUTPUT_FORMAT": true,
+    "NEVER_include_explanations_or_apologies_in_output": true,
+    "NEVER_DEVIATE_FROM_OUTPUT_FORMAT": true,
+    "plan_format": "command,location_or_object,id",
     "separator": " then ",
     "append_newline": true,
-    "include_confirmation_request": true,
+    "ALWAYS_include_confirmation_request": true,
     "confirmation_describes_overall_task": true
   },
 

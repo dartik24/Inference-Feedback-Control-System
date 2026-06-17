@@ -126,6 +126,7 @@ class VoiceControlNode(Node):
         self.destination = None
         self.splitter = None
         self.comm = None
+        self.triggers = ["stretch", "robot", "buddy", "companion", "pal", "mate", "amigo", "friend"]
 
         # Configuration and prompt loading
         with open(Path(get_package_share_directory('turtlebot4_voice_control')) / 'Config' / 'config.json', "r", encoding="utf-8") as f:
@@ -343,11 +344,22 @@ class VoiceControlNode(Node):
                 
                 try:
                     command = self.recognizer.recognize_google(audio).lower().strip()
+                    isRequest = any(trigger in command for trigger in self.triggers)
                     
-                    if command:
-                        self.get_logger().info(f"Recognized command: {command}")
-                        self.speak("Got it")
-                        self.handle_command(command)
+                    if self.splitter is None:
+                        if command and isRequest:
+                            self.get_logger().info(f"Recognized command: {command}")
+                            self.speak("Got it")
+                            self.handle_command(command)
+                        else:
+                            continue
+                    else:
+                        if command:
+                            self.get_logger().info(f"Recognized command: {command}")
+                            self.speak("Got it")
+                            self.handle_command(command)
+                        else:
+                            continue
 
                 except sr.UnknownValueError:
                     self.get_logger().info("None Recieved")
@@ -377,7 +389,7 @@ class VoiceControlNode(Node):
     # Edit 2: modified the strucuture to now update and sync action list immediatly after intial proposed commands are generated. If modified or rejected proposed action list is regenerated or deleted accordingly. 
     def command_interpretation(self, command):
         if self.splitter == None:
-            self.speak("Give me a moment to think")
+            # self.speak("Give me a moment to think")
             self.comm = command
             completion = self.client.chat.completions.create(
                 model=self.config["openai"]["model"],
@@ -393,26 +405,33 @@ class VoiceControlNode(Node):
                 max_tokens=100,
             )
             print(completion.choices[0].message.content)
-            self.splitter = completion.choices[0].message.content.splitlines()
-            self.speak(self.splitter[1])
-            if self.splitter[0]:
-                tg = 0
-                self.splitter[0] = self.splitter[0].split(" then ")
-                while self.addactcount != 0:
-                    self.actions.pop()
-                    self.addactcount = self.addactcount - 1
-                    self.actionnum = self.actionnum - 1
-                for subcommand in self.splitter[0]:
-                    targets = subcommand.split(",")
-                    if len(targets) > 3:
-                        self.speak("I dont think I got that, could you say that again?") 
-                    self.add_action((targets[0], targets[1], self.gid + int(targets[2])))
-                    self.actionnum = self.actionnum + 1
-                    self.addactcount = self.addactcount + 1
-                    tg = int(targets[2])
-                self.gid = self.gid + tg
-                print(self.gid)
-            return None
+            try:
+                self.splitter = completion.choices[0].message.content.splitlines()
+                if self.splitter[1]:
+                    self.speak(self.splitter[1])
+                else:
+                    self.speak("Please confirm that that is what you want me to do.")
+                if self.splitter[0]:
+                    tg = 0
+                    self.splitter[0] = self.splitter[0].split(" then ")
+                    while self.addactcount != 0:
+                        self.actions.pop()
+                        self.addactcount = self.addactcount - 1
+                        self.actionnum = self.actionnum - 1
+                    for subcommand in self.splitter[0]:
+                        targets = subcommand.split(",")
+                        if len(targets) > 3:
+                            self.speak("I dont think I got that, could you say that again?") 
+                        self.add_action((targets[0], targets[1], self.gid + int(targets[2])))
+                        self.actionnum = self.actionnum + 1
+                        self.addactcount = self.addactcount + 1
+                        tg = int(targets[2])
+                    self.gid = self.gid + tg
+                    print(self.gid)
+                return None
+            except:
+                return self.command_interpretation(self.comm)
+
         else:
             completion = self.client.chat.completions.create(
                 model=self.config["openai"]["model"],
