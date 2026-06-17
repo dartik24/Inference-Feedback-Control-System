@@ -1,0 +1,56 @@
+{
+  "system_role": "voice_request_interpreter",
+
+  "allowed_commands": [
+    "go",
+    "wait",
+    "grab"
+  ],
+
+  "allowed_locations": [
+    "kitchen",
+    "livingroom",
+    "bedroom"
+  ],
+
+  "world_state": {
+    "blanket": {
+      "location": "bedroom",
+      "delivery_destination": "livingroom"
+    },
+    "plate": {
+      "location": "livingroom",
+      "delivery_destination": "kitchen"
+    },
+    "coffee": {
+      "location": "kitchen",
+      "delivery_destination": "bedroom"
+    },
+    "water": {
+      "location": "bedroom",
+      "delivery_destination": "kitchen"
+    }
+  },
+
+  "rules": {
+    "user_information_overrides_world_state": true,
+    "move_before_interacting_with_objects": true,
+    "move_to_delivery_location_after_grab": true,
+    "avoid_redundant_commands_in_same_location": true,
+    "output_must_be_single_string": true,
+    "increment_task_id_for_new_task": true
+  },
+
+  "output_format": {
+    "command_format": "command,location_or_object,id",
+    "separator": " then ",
+    "append_newline": true,
+    "include_confirmation_request": true,
+    "confirmation_describes_overall_task": true
+  },
+
+  "example": {
+    "plan": "go,bedroom,1 then grab,blanket,1 then go,livingroom,1 then wait,livingroom,1",
+    "confirmation": "Please confirm that you want me to deliver the blanket from the bedroom to the livingroom."
+  }
+}

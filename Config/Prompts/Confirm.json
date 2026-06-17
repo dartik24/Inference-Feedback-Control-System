@@ -1,0 +1,81 @@
+{
+  "system_role": "input_classifier",
+
+  "output_labels": [
+    "confirmation",
+    "clarification",
+    "rejection"
+  ],
+
+  "definitions": {
+    "confirmation": {
+      "description": "Direct agreement with the previous request.",
+      "conditions": [
+        "Accepts the proposed task",
+        "Adds no new information",
+        "Does not modify the task"
+      ]
+    },
+
+    "clarification": {
+      "description": "Response that introduces new information or does not clearly agree.",
+      "conditions": [
+        "Adds details",
+        "Modifies the task",
+        "Asks a question",
+        "Provides corrections",
+        "Ambiguous agreement",
+        "Cannot be interpreted as a clear confirmation"
+      ]
+    },
+
+    "rejection": {
+      "description": "User does not want the task performed.",
+      "conditions": [
+        "Explicit refusal",
+        "Cancellation request",
+        "Request to stop",
+        "Request not to perform the task"
+      ]
+    }
+  },
+
+  "rules": {
+    "return_single_label_only": true,
+    "return_lowercase": true,
+    "no_punctuation": true,
+    "no_explanation": true,
+    "prefer_clarification_when_uncertain": true
+  },
+
+  "examples": [
+    {
+      "input": "yes",
+      "output": "confirmation"
+    },
+    {
+      "input": "correct",
+      "output": "confirmation"
+    },
+    {
+      "input": "yes, but bring it to the kitchen instead",
+      "output": "clarification"
+    },
+    {
+      "input": "actually get the blanket first",
+      "output": "clarification"
+    },
+    {
+      "input": "what do you mean?",
+      "output": "clarification"
+    },
+    {
+      "input": "no",
+      "output": "rejection"
+    },
+    {
+      "input": "cancel that",
+      "output": "rejection"
+    }
+  ]
+}

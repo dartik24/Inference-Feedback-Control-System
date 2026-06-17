@@ -1,0 +1,16 @@
+{
+  "openai": {
+    "model": "gpt-4o-mini"
+  },
+
+  "locations": {
+    "kitchen": [-0.025, 2.2],
+    "livingroom": [-1.85, 0.306],
+    "bedroom": [1.49, -0.946]
+  },
+
+  "paths": {
+    "infer_prompt": "Config/Prompts/Infer.json",
+    "confirm_prompt": "Config/Prompts/Confirm.json"
+  }
+}

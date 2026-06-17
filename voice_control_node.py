@@ -26,6 +26,7 @@ import time
 import os
 import sys
 import numpy as np
+import json
 import math
 from math import sqrt
 import threading
@@ -44,8 +45,6 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
-
-
 
 @contextmanager
 def ignore_stderr():
@@ -125,37 +124,25 @@ class VoiceControlNode(Node):
         self.destination = None
         self.splitter = None
         self.comm = None
-        self.prompt = """You are a voice request interpreter.
-            Convert the user’s request into a sequence of commands using ONLY:
-            - Commands: go, wait, grab
-            - Locations: kitchen, livingroom, bedroom
 
-            Assume this world state:
-            - A blanket is in the bedroom → MUST deliver to the livingroom
-            - A plate is in the livingroom → MUST deliver to the kitchen
-            - A cup of coffee is in the kitchen → MUST deliver to the bedroom
-            - A glass of water is in the bedroom → MUST deliver to the kitchen
+        # Configuration and prompt loading
+        with open("Config/config.json", "r", encoding="utf-8") as f:
+            self.config = json.load(f)
 
-            Rules:
-            - User-provided information always overrides the assumed world state
-            - Move to a location before interacting with objects
-            - Move to a location to complete the delivery of an object
-            - Do not repeat commands in the same location unnecessarily
-            - Output must be a single string
+        with open(self.config["paths"]["infer_prompt"], "r", encoding="utf-8") as f:
+            self.prompt = (
+                "You are a voice request interpreter.\n\n"
+                "Use the following configuration:\n\n"
+                + json.dumps(json.load(f), indent=2)
+            )
 
-            Output format (strict):
-            - One line: commands formatted as command,location,id
-            - Commands separated by: " then "
-            - Assign an id to each command, increment the id if the command belongs to a new task.
-            - Append a newline character (\n)
-            - After the newline, ask for confirmation describing the overall task
-
-            Example:
-            go,bedroom,1 then grab,blanket,1 then go,livingroom,1 then wait,livingroom,1
-            Please confirm that you want me to deliver the blanket from the bedroom to the livingroom.
-            """
-        self.conPrompt = """You are an input classifier. Determine whether the provided input is a confirmation, clarification or rejection. A confirmation is a direct agreement with the previous request and adds no new information. A clarification is any response that does not clearly agree or that introduces new details. A rejection is a demand from the user to not perform the task. Your response must be exactly one word, lowercase, with no punctuation or additional text: confirmation, clarification or rejection."""
-
+        with open(self.config["paths"]["confirm_prompt"], "r", encoding="utf-8") as f:
+            self.conPrompt = (
+                "You are an input classifier.\n\n"
+                "Use the following configuration:\n\n"
+                + json.dumps(json.load(f), indent=2)
+                + "\n\nIMPORTANT: Your response must consist of exactly one label and nothing else."
+            )
         # "You are a voice request interpreter. Your role is to interpret any user input and convert it into a sequence of commands using only the following commands: go, wait, and the following locations: kitchen, livingroom, bedroom. Always assume the following world state: a warm blanket is in the bedroom and must be delivered to the livingroom; a dirty plate is in the livingroom and must be delivered to the kitchen; a full cup of coffee is in the kitchen and must be delivered to the bedroom; a full glass of water is in the livingroom and must be delivered to the kitchen. Task rules: perform only one object delivery task per output unless explicitly instructed otherwise, avoid repeating locations unnecessarily, assume movement is required before interacting with an object, do not include explanations or extra text, and the output must be a single string. Output format is strict: the output must be one string containing two parts—(1) a command sequence where each command is formatted as command,location and all commands are on one line separated by the word ' then ', and (2) a confirmation section appended after the command sequence separated by a newline character (\\n). The confirmation section must be a request for confirmation and must clearly state the overall task being performed. Example output format: \"go,bedroom then go,livingroom then wait,livingroom\\nPlease confirm that you want me to deliver the warm blanket from the bedroom to the livingroom.\""
 
         # You are a voice request interpreter. Your job is to interpret any input as one of these commands: [go, wait]. And to one of these locations: [kitchen, livingroom, bedroom]. Always format your response like this: command1,location1 then command2,location2 then command3,location3 then etc (new line with the confirmation section content) Always assume: - A warm blanket is in the bedroom and needs to get to the livingroom. - A dirty plate is in the livingroom and needs to get to the kitchen. - A full cup of coffee is in the kitchen and needs to get to the bedroom. -A full glass of water in the livingroom and needs to get to the kitchen. Avoid repeating locations unnecessarily. Always an additional confirmation section to the output on a new line. Always make the confirmation section be a request for confirmation of the task at hand. Always mention what the overall task at hand is. Try to limit to one object delivery task per output unless otherwise requested.
@@ -163,9 +150,8 @@ class VoiceControlNode(Node):
         # Your job is to interpret the provided input as confirmation or clarification, a confirmation is if the input is a direct agreement with a previous request, a clarification is if the user does not provide direct agreement or adds new details. Reply simple with one word, confirmation or clarification.    
 
         # Preset Locations
-        self.kitchen = [-0.025, 2.2]
-        self.livingroom = [-1.85, 0.306]
-        self.bedroom = [1.49, -0.946]
+        for room, coords in self.config["locations"].items():
+            setattr(self, room, coords)
 
         # Sound engine
         pygame.mixer.init()
@@ -323,7 +309,7 @@ class VoiceControlNode(Node):
 
     def api_initializer(self):
         completion = self.client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=self.config["openai"]["model"],
             messages=[
                 {"role": "system",
                  "content": self.prompt},
@@ -405,7 +391,7 @@ class VoiceControlNode(Node):
             self.speak("Give me a moment to think")
             self.comm = command
             completion = self.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=self.config["openai"]["model"],
                 messages=[
                     {"role": "system",
                     "content": self.prompt},
@@ -440,7 +426,7 @@ class VoiceControlNode(Node):
             return None
         else:
             completion = self.client.chat.completions.create(
-                model="gpt-4o-mini",
+                model=self.config["openai"]["model"],
                 messages=[
                     {"role": "system",
                     "content": self.conPrompt},
