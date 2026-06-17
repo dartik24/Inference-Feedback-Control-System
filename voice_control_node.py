@@ -509,6 +509,10 @@ class VoiceControlNode(Node):
         self.sync_actions_for_http()
         # self.speak("Task added to the queue.")
 
+    #WORK IN PROGRESS FUNCTION FOR TASK OPTIMIZATION, CURRENTLY NOT IN USE.
+    # def optimize_queue(self):
+
+
     # Command execution off the top of the queue
     def process_task_queue(self):
         while rclpy.ok():
