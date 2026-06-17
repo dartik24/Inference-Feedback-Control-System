@@ -370,14 +370,6 @@ class VoiceControlNode(Node):
                 if len(targets) > 3:
                     self.speak("I dint fully understand, could you say that again?") 
 
-                if task_type not in ["go", "wait", "grab"]:
-                    self.speak("I did not understand that action.")
-                    continue
-
-                if  not hasattr(self, task_dest):
-                    self.speak(f"I do not know the location {task_dest}.")
-                    continue
-
                 self.add_task_to_queue((task_type, task_dest))
 
     # Voice command interpretation
