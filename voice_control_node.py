@@ -34,6 +34,8 @@ from threading import Lock
 from std_msgs.msg import String
 from queue import Queue
 from datetime import datetime
+from pathlib import Path
+from ament_index_python.packages import get_package_share_directory
 
 #VISION
 import cv2
@@ -126,17 +128,17 @@ class VoiceControlNode(Node):
         self.comm = None
 
         # Configuration and prompt loading
-        with open("Config/config.json", "r", encoding="utf-8") as f:
+        with open(Path(get_package_share_directory('turtlebot4_voice_control')) / 'Config' / 'config.json', "r", encoding="utf-8") as f:
             self.config = json.load(f)
 
-        with open(self.config["paths"]["infer_prompt"], "r", encoding="utf-8") as f:
+        with open(Path(get_package_share_directory('turtlebot4_voice_control')) / self.config['paths']['infer_prompt'], "r", encoding="utf-8") as f:
             self.prompt = (
                 "You are a voice request interpreter.\n\n"
                 "Use the following configuration:\n\n"
                 + json.dumps(json.load(f), indent=2)
             )
 
-        with open(self.config["paths"]["confirm_prompt"], "r", encoding="utf-8") as f:
+        with open(Path(get_package_share_directory('turtlebot4_voice_control')) / self.config['paths']['confirm_prompt'], "r", encoding="utf-8") as f:
             self.conPrompt = (
                 "You are an input classifier.\n\n"
                 "Use the following configuration:\n\n"
