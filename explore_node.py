@@ -1,283 +1,425 @@
-import rclpy
-from rclpy.node import Node
-from rclpy.action import ActionClient
-
-from geometry_msgs.msg import Twist
-from nav2_msgs.action import NavigateToPose
-from action_msgs.msg import GoalStatus
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-from sensor_msgs.msg import Image
-from cv_bridge import CvBridge
-from ultralytics import YOLO
+#!/usr/bin/env python3
 
 import math
 import time
-import numpy as np
-from std_msgs.msg import String
+from collections import deque
 
-from std_srvs.srv import Trigger
-from control_msgs.action import FollowJointTrajectory
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+from rclpy.action import ActionClient
+from rclpy.duration import Duration
+
+from nav_msgs.msg import OccupancyGrid
+from geometry_msgs.msg import PoseStamped, Twist
+from nav2_msgs.action import NavigateToPose
+
+import tf2_ros
+
 
 class ExploreNode(Node):
     def __init__(self):
         super().__init__("explore_node")
 
-        self.nav_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
-        self.cmd_vel_pub = self.create_publisher(Twist, "/stretch/cmd_vel", 10)
+# Modify as needed for your exploration parameters
+        self.declare_parameter("exploration_threshold", 0.97)
+        self.declare_parameter("frontier_min_size", 20)
+        self.declare_parameter("planning_rate", 1.0)
+        self.declare_parameter("goal_timeout_sec", 120.0)
+        self.declare_parameter("distance_weight", 1.0)
+        self.declare_parameter("size_weight", 2.0)
+        self.declare_parameter("scan_after_goal", True)
+        self.declare_parameter("robot_base_frame", "base_link")
+        self.declare_parameter("map_frame", "map")
 
-        self.joint_pose_pub = self.create_publisher(String, "/joint_pose_cmd", 10)
+# Read parameters
+        self.exploration_threshold = self.get_parameter("exploration_threshold").value
+        self.frontier_min_size = self.get_parameter("frontier_min_size").value
+        self.planning_rate = self.get_parameter("planning_rate").value
+        self.goal_timeout_sec = self.get_parameter("goal_timeout_sec").value
+        self.distance_weight = self.get_parameter("distance_weight").value
+        self.size_weight = self.get_parameter("size_weight").value
+        self.scan_after_goal = self.get_parameter("scan_after_goal").value
+        self.robot_base_frame = self.get_parameter("robot_base_frame").value
+        self.map_frame = self.get_parameter("map_frame").value
 
-        self.bridge = CvBridge()
+        self.latest_map = None
+        self.map_array = None
+        self.active_goal = False
+        self.goal_start_time = None
+        self.goal_handle = None
+        self.blacklisted_goals = []
 
-        self.model = YOLO("yolov8s.pt")
-
-        self.image_sub = self.create_subscription(
-            Image,
-            "/camera/color/image_raw",
-            self.image_callback,
+# ROS 2 subscriptions, publishers, and action clients
+        self.map_sub = self.create_subscription(
+            OccupancyGrid,
+            "/map",
+            self.map_callback,
             10
         )
 
-        self.waypoints = [
-            (-2.57, -2.76),
-            (-0.306, 0.276),
-            (-0.459, -3.83),
-            (1.22, 2.83),
+        self.cmd_vel_pub = self.create_publisher(
+            Twist,
+            "/stretch/cmd_vel",
+            10
+        )
+
+        self.nav_client = ActionClient(
+            self,
+            NavigateToPose,
+            "navigate_to_pose"
+        )
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(
+            self.tf_buffer,
+            self
+        )
+
+        self.timer = self.create_timer(
+            1.0 / self.planning_rate,
+            self.exploration_loop
+        )
+
+        self.get_logger().info("Explore node started.")
+
+    def map_callback(self, msg):
+        self.latest_map = msg
+
+        width = msg.info.width
+        height = msg.info.height
+
+        data = np.array(msg.data, dtype=np.int16)
+        self.map_array = data.reshape((height, width))
+
+    def exploration_loop(self):
+        if self.latest_map is None or self.map_array is None:
+            self.get_logger().info("Waiting for /map...")
+            return
+
+        exploration = self.compute_exploration_coefficient()
+
+        self.get_logger().info(
+            f"Exploration coefficient: {exploration:.3f}"
+        )
+
+        if exploration >= self.exploration_threshold:
+            self.get_logger().info("Exploration threshold reached.")
+            self.cancel_current_goal()
+            self.stop_robot()
+            return
+
+        if self.active_goal:
+            if self.goal_timed_out():
+                self.get_logger().warn("Goal timed out. Canceling and blacklisting.")
+                self.blacklist_current_goal()
+                self.cancel_current_goal()
+            return
+
+        robot_pose = self.get_robot_pose()
+        if robot_pose is None:
+            self.get_logger().warn("Could not get robot pose.")
+            return
+
+        frontiers = self.find_frontiers()
+        clusters = self.cluster_frontiers(frontiers)
+
+        valid_clusters = [
+            c for c in clusters
+            if len(c) >= self.frontier_min_size
         ]
 
-        self.position_mode_client = self.create_client(
-            Trigger,
-            "/switch_to_position_mode"
-        )
+        if not valid_clusters:
+            self.get_logger().warn("No valid frontiers found. Exploration may be complete or stuck.")
+            self.stop_robot()
+            return
 
-        self.navigation_mode_client = self.create_client(
-            Trigger,
-            "/switch_to_navigation_mode"
-        )
+        best_goal = self.choose_best_frontier(valid_clusters, robot_pose)
 
-        self.head_client = ActionClient(
-            self,
-            FollowJointTrajectory,
-            "/stretch_controller/follow_joint_trajectory"
-        )
+        if best_goal is None:
+            self.get_logger().warn("No reachable non-blacklisted frontier found.")
+            self.stop_robot()
+            return
 
-        self.world_state_path = "world_state.txt"
+        self.send_nav_goal(best_goal[0], best_goal[1])
 
-        self.object_counts = {}
+    def compute_exploration_coefficient(self):
+        unknown = np.count_nonzero(self.map_array == -1)
+        known = np.count_nonzero(self.map_array != -1)
 
-        # self.allowed_objects = {
-        #     "person",
-        #     "chair",
-        #     "couch",
-        #     "bed",
-        #     "dining table",
-        #     "tv",
-        #     "laptop",
-        #     "keyboard",
-        #     "mouse",
-        #     "remote",
-        #     "cell phone",
-        #     "book",
-        #     "cup",
-        #     "bottle",
-        #     "backpack",
-        #     "blanket",
-        #     "handbag",
-        #     "sink",
-        #     "refrigerator",
-        #     "microwave",
-        #     "oven",
-        #     "toaster",
-        #     "potted plant",
-        #     "clock",
-        # }
+        total = known + unknown
 
-        self.confidence_threshold = 0.5
-        self.min_seen_count = 5
+        if total == 0:
+            return 0.0
 
-    def explore(self):
-        self.get_logger().info("Starting exploration")
-        open(self.world_state_path, "w").close()
+        return known / total
 
-        for x, y in self.waypoints:
-            success = self.navigate_to(x, y)
+    def find_frontiers(self):
+        frontiers = []
 
-            if success:
-                self.scan_360()
-                self.save_world_state(x, y)
+        height, width = self.map_array.shape
 
-        self.get_logger().info("Exploration complete")
+        for y in range(1, height - 1):
+            for x in range(1, width - 1):
+                if self.map_array[y, x] != 0:
+                    continue
 
-    def switch_to_position_mode(self):
-        if not self.position_mode_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error("Position mode service not available")
-            return False
+                neighborhood = self.map_array[y - 1:y + 2, x - 1:x + 2]
 
-        req = Trigger.Request()
-        future = self.position_mode_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future)
+                if np.any(neighborhood == -1):
+                    frontiers.append((x, y))
 
-        result = future.result()
-        self.get_logger().info(f"Position mode: {result.message}")
-        return result.success
+        return frontiers
 
+    def cluster_frontiers(self, frontiers):
+        frontier_set = set(frontiers)
+        visited = set()
+        clusters = []
 
-    def switch_to_navigation_mode(self):
-        if not self.navigation_mode_client.wait_for_service(timeout_sec=5.0):
-            self.get_logger().error("Navigation mode service not available")
-            return False
+        for cell in frontiers:
+            if cell in visited:
+                continue
 
-        req = Trigger.Request()
-        future = self.navigation_mode_client.call_async(req)
-        rclpy.spin_until_future_complete(self, future)
+            cluster = []
+            queue = deque([cell])
+            visited.add(cell)
 
-        result = future.result()
-        self.get_logger().info(f"Navigation mode: {result.message}")
-        return result.success
+            while queue:
+                current = queue.popleft()
+                cluster.append(current)
 
-    def navigate_to(self, x, y, theta=0.0):
-        self.get_logger().info(f"Navigating to ({x}, {y})")
+                cx, cy = current
+
+                neighbors = [
+                    (cx + 1, cy),
+                    (cx - 1, cy),
+                    (cx, cy + 1),
+                    (cx, cy - 1),
+                    (cx + 1, cy + 1),
+                    (cx - 1, cy - 1),
+                    (cx + 1, cy - 1),
+                    (cx - 1, cy + 1),
+                ]
+
+                for n in neighbors:
+                    if n in frontier_set and n not in visited:
+                        visited.add(n)
+                        queue.append(n)
+
+            clusters.append(cluster)
+
+        return clusters
+
+    def choose_best_frontier(self, clusters, robot_pose):
+        robot_x, robot_y = robot_pose
+
+        best_score = -float("inf")
+        best_goal = None
+
+        for cluster in clusters:
+            centroid_cell = self.compute_cluster_centroid(cluster)
+            world_point = self.map_to_world(
+                centroid_cell[0],
+                centroid_cell[1]
+            )
+
+            if world_point is None:
+                continue
+
+            gx, gy = world_point
+
+            if self.is_blacklisted(gx, gy):
+                continue
+
+            distance = math.sqrt(
+                (gx - robot_x) ** 2 +
+                (gy - robot_y) ** 2
+            )
+
+            cluster_size = len(cluster)
+
+            score = (
+                self.size_weight * cluster_size
+                - self.distance_weight * distance
+            )
+
+            if score > best_score:
+                best_score = score
+                best_goal = (gx, gy)
+
+        return best_goal
+
+    def compute_cluster_centroid(self, cluster):
+        xs = [p[0] for p in cluster]
+        ys = [p[1] for p in cluster]
+
+        cx = int(sum(xs) / len(xs))
+        cy = int(sum(ys) / len(ys))
+
+        return cx, cy
+
+    def map_to_world(self, mx, my):
+        if self.latest_map is None:
+            return None
+
+        resolution = self.latest_map.info.resolution
+        origin = self.latest_map.info.origin.position
+
+        wx = origin.x + (mx + 0.5) * resolution
+        wy = origin.y + (my + 0.5) * resolution
+
+        return wx, wy
+
+    def world_to_map(self, wx, wy):
+        if self.latest_map is None:
+            return None
+
+        resolution = self.latest_map.info.resolution
+        origin = self.latest_map.info.origin.position
+
+        mx = int((wx - origin.x) / resolution)
+        my = int((wy - origin.y) / resolution)
+
+        height, width = self.map_array.shape
+
+        if mx < 0 or my < 0 or mx >= width or my >= height:
+            return None
+
+        return mx, my
+
+    def get_robot_pose(self):
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.robot_base_frame,
+                rclpy.time.Time(),
+                timeout=Duration(seconds=0.5)
+            )
+
+            x = transform.transform.translation.x
+            y = transform.transform.translation.y
+
+            return x, y
+
+        except Exception as e:
+            self.get_logger().warn(f"TF lookup failed: {e}")
+            return None
+
+    def send_nav_goal(self, x, y):
+        if not self.nav_client.wait_for_server(timeout_sec=2.0):
+            self.get_logger().error("Nav2 NavigateToPose action server not available.")
+            return
 
         goal_msg = NavigateToPose.Goal()
-        goal_msg.pose.header.frame_id = "map"
+
+        goal_msg.pose = PoseStamped()
+        goal_msg.pose.header.frame_id = self.map_frame
         goal_msg.pose.header.stamp = self.get_clock().now().to_msg()
 
         goal_msg.pose.pose.position.x = x
         goal_msg.pose.pose.position.y = y
+        goal_msg.pose.pose.position.z = 0.0
 
-        goal_msg.pose.pose.orientation.z = np.sin(theta / 2.0)
-        goal_msg.pose.pose.orientation.w = np.cos(theta / 2.0)
+        goal_msg.pose.pose.orientation.w = 1.0
 
-        if not self.nav_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("Nav2 action server not available!")
-            return False
+        self.get_logger().info(f"Sending exploration goal: x={x:.2f}, y={y:.2f}")
 
-        future = self.nav_client.send_goal_async(goal_msg)
-        rclpy.spin_until_future_complete(self, future)
+        self.active_goal = True
+        self.goal_start_time = time.time()
+        self.current_goal_xy = (x, y)
 
+        send_future = self.nav_client.send_goal_async(
+            goal_msg,
+            feedback_callback=self.nav_feedback_callback
+        )
+
+        send_future.add_done_callback(self.goal_response_callback)
+
+    def goal_response_callback(self, future):
         goal_handle = future.result()
 
-        if not goal_handle or not goal_handle.accepted:
-            self.get_logger().error("Goal rejected")
-            return False
+        if not goal_handle.accepted:
+            self.get_logger().warn("Goal rejected by Nav2.")
+            self.active_goal = False
+            self.blacklist_current_goal()
+            return
+
+        self.get_logger().info("Goal accepted by Nav2.")
+
+        self.goal_handle = goal_handle
 
         result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
+        result_future.add_done_callback(self.goal_result_callback)
 
-        result = result_future.result()
+    def nav_feedback_callback(self, feedback_msg):
+        feedback = feedback_msg.feedback
+        distance = feedback.distance_remaining
 
-        if result.status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info("Navigation succeeded")
-            return True
-        else:
-            self.get_logger().error(f"Navigation failed with status {result.status}")
+        self.get_logger().debug(
+            f"Distance remaining: {distance:.2f} m"
+        )
+
+    def goal_result_callback(self, future):
+        result = future.result()
+        status = result.status
+
+        self.get_logger().info(f"Navigation finished with status: {status}")
+
+        self.active_goal = False
+        self.goal_handle = None
+        self.goal_start_time = None
+
+        if self.scan_after_goal:
+            self.rotate_360()
+
+    def cancel_current_goal(self):
+        if self.goal_handle is not None:
+            self.goal_handle.cancel_goal_async()
+
+        self.active_goal = False
+        self.goal_handle = None
+        self.goal_start_time = None
+
+    def goal_timed_out(self):
+        if self.goal_start_time is None:
             return False
 
-    def scan_360(self):
-        self.object_counts.clear()
+        elapsed = time.time() - self.goal_start_time
 
-        self.switch_to_position_mode()
-        self.set_head_tilt(-0.38) 
+        return elapsed > self.goal_timeout_sec
 
-        self.switch_to_navigation_mode()
+    def blacklist_current_goal(self):
+        if hasattr(self, "current_goal_xy"):
+            self.blacklisted_goals.append(self.current_goal_xy)
+
+    def is_blacklisted(self, x, y, radius=0.5):
+        for bx, by in self.blacklisted_goals:
+            dist = math.sqrt((x - bx) ** 2 + (y - by) ** 2)
+
+            if dist < radius:
+                return True
+
+        return False
+
+    def rotate_360(self):
+        self.get_logger().info("Performing 360 degree scan.")
 
         twist = Twist()
-        twist.angular.z = 0.3
+        twist.angular.z = 0.5
 
-        duration = (2.0 * math.pi) / abs(twist.angular.z)
+        duration = 2.0 * math.pi / abs(twist.angular.z)
         start = time.time()
 
-        while time.time() - start < duration:
+        while rclpy.ok() and time.time() - start < duration:
             self.cmd_vel_pub.publish(twist)
-            rclpy.spin_once(self, timeout_sec=0.1)
+            time.sleep(0.05)
 
         self.stop_robot()
 
-        self.switch_to_position_mode()
-        self.set_head_tilt(0.0)
-        self.switch_to_navigation_mode()
-
-    def image_callback(self, msg):
-        frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
-
-        detected_objects = self.detect_objects(frame)
-
-        for obj in detected_objects:
-            self.object_counts[obj] = self.object_counts.get(obj, 0) + 1
-
-    def detect_objects(self, frame):
-        objects = []
-
-        results = self.model(frame, verbose=False)
-
-        for result in results:
-            for box in result.boxes:
-                confidence = float(box.conf[0])
-
-                if confidence < self.confidence_threshold:
-                    continue
-
-                class_id = int(box.cls[0])
-                label = result.names[class_id]
-
-                # if label not in self.allowed_objects:
-                #     continue
-
-                objects.append(label)
-
-        return objects
-
-    def set_head_tilt(self, angle_rad):
-        if not self.head_client.wait_for_server(timeout_sec=5.0):
-            self.get_logger().error("Head trajectory action server not available")
-            return False
-
-        goal = FollowJointTrajectory.Goal()
-        goal.trajectory.joint_names = ["joint_head_tilt"]
-
-        point = JointTrajectoryPoint()
-        point.positions = [angle_rad]
-        point.time_from_start.sec = 2
-
-        goal.trajectory.points.append(point)
-
-        future = self.head_client.send_goal_async(goal)
-        rclpy.spin_until_future_complete(self, future)
-
-        goal_handle = future.result()
-
-        if not goal_handle or not goal_handle.accepted:
-            self.get_logger().error("Head tilt goal rejected")
-            return False
-
-        result_future = goal_handle.get_result_async()
-        rclpy.spin_until_future_complete(self, result_future)
-
-        self.get_logger().info(f"Head tilt set to {angle_rad}")
-        return True
-
     def stop_robot(self):
-        self.cmd_vel_pub.publish(Twist())
-
-    def save_world_state(self, x, y):
-        reliable_objects = {
-            obj: count
-            for obj, count in self.object_counts.items()
-            if count >= self.min_seen_count
-        }
-
-        with open(self.world_state_path, "a") as f:
-            f.write(f"Location: ({x}, {y})\n")
-            f.write("Objects seen:\n")
-
-            if len(reliable_objects) == 0:
-                f.write("- None\n")
-            else:
-                for obj, count in sorted(reliable_objects.items()):
-                    f.write(f"- {obj} ({count} detections)\n")
-
-            f.write("\n")
-
+        twist = Twist()
+        self.cmd_vel_pub.publish(twist)
 
 def main(args=None):
     rclpy.init(args=args)
@@ -285,12 +427,14 @@ def main(args=None):
     node = ExploreNode()
 
     try:
-        node.explore()
+        rclpy.spin(node)
     except KeyboardInterrupt:
+        node.get_logger().info("Explore node interrupted.")
+    finally:
+        node.cancel_current_goal()
         node.stop_robot()
-
-    node.destroy_node()
-    rclpy.shutdown()
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == "__main__":
