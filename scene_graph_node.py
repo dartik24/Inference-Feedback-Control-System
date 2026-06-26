@@ -8,7 +8,7 @@ import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import PoseWithCovarianceStamped, PointStamped
+from geometry_msgs.msg import PointStamped
 from std_msgs.msg import String
 
 from cv_bridge import CvBridge
@@ -27,16 +27,16 @@ class WorldSceneGraphNode(Node):
 
         self.latest_rgb = None
         self.latest_depth = None
-        self.latest_pose = None
         self.camera_info = None
+        self.latest_pose = None
 
         self.rgb_topic = "/camera/color/image_raw"
         self.depth_topic = "/camera/depth/image_rect_raw"
         self.camera_info_topic = "/camera/color/camera_info"
-        self.pose_topic = "/amcl_pose"
 
         self.camera_frame = "camera_color_optical_frame"
         self.map_frame = "map"
+        self.base_frame = "base_link"
 
         self.update_period_sec = 3.0
         self.conf_threshold = 0.45
@@ -61,9 +61,12 @@ class WorldSceneGraphNode(Node):
         self.create_subscription(Image, self.rgb_topic, self.rgb_callback, 10)
         self.create_subscription(Image, self.depth_topic, self.depth_callback, 10)
         self.create_subscription(CameraInfo, self.camera_info_topic, self.camera_info_callback, 10)
-        self.create_subscription(PoseWithCovarianceStamped, self.pose_topic, self.pose_callback, 10)
 
-        self.scene_graph_pub = self.create_publisher(String, "scene_graph", 10)
+        self.scene_graph_pub = self.create_publisher(
+            String,
+            "scene_graph",
+            10
+        )
 
         self.timer = self.create_timer(
             self.update_period_sec,
@@ -75,49 +78,83 @@ class WorldSceneGraphNode(Node):
         self.get_logger().info("World scene graph node started.")
 
     def rgb_callback(self, msg):
-        """Store latest RGB image."""
+        """Store latest RGB camera image."""
         try:
-            self.latest_rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+            self.latest_rgb = self.bridge.imgmsg_to_cv2(
+                msg,
+                desired_encoding="bgr8"
+            )
         except Exception as e:
             self.get_logger().error(f"RGB conversion failed: {e}")
 
     def depth_callback(self, msg):
         """Store latest depth image."""
         try:
-            self.latest_depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+            self.latest_depth = self.bridge.imgmsg_to_cv2(
+                msg,
+                desired_encoding="passthrough"
+            )
         except Exception as e:
             self.get_logger().error(f"Depth conversion failed: {e}")
 
     def camera_info_callback(self, msg):
-        """Store camera intrinsics."""
+        """Store latest camera intrinsics."""
         self.camera_info = msg
 
-    def pose_callback(self, msg):
-        """Store latest robot pose."""
-        p = msg.pose.pose.position
-        q = msg.pose.pose.orientation
+    def update_robot_pose_from_tf(self):
+        """
+        Gets the robot pose from TF instead of /amcl_pose.
 
-        self.latest_pose = {
-            "x": p.x,
-            "y": p.y,
-            "z": p.z,
-            "qx": q.x,
-            "qy": q.y,
-            "qz": q.z,
-            "qw": q.w,
-            "frame_id": msg.header.frame_id
-        }
+        This looks up:
+
+            map -> base_link
+
+        If your robot only has odom -> base_link, change:
+
+            self.map_frame = "odom"
+        """
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.map_frame,
+                self.base_frame,
+                rclpy.time.Time()
+            )
+
+            t = transform.transform.translation
+            q = transform.transform.rotation
+
+            self.latest_pose = {
+                "x": float(t.x),
+                "y": float(t.y),
+                "z": float(t.z),
+                "qx": float(q.x),
+                "qy": float(q.y),
+                "qz": float(q.z),
+                "qw": float(q.w),
+                "frame_id": self.map_frame
+            }
+
+            return True
+
+        except Exception as e:
+            self.get_logger().warn(f"Could not get robot pose from TF: {e}")
+            return False
 
     def update_scene_graph(self):
         """
-        Main update loop:
-        1. Detect current objects.
-        2. Estimate 3D positions.
-        3. Transform positions into map frame.
-        4. Merge observations into persistent memory.
-        5. Infer global object-object edges.
-        6. Infer room clusters from tightly connected objects.
-        7. Save and publish graph.
+        Main update loop.
+
+        Each cycle:
+        1. Checks camera data.
+        2. Gets robot pose from TF.
+        3. Detects objects.
+        4. Estimates 3D object positions.
+        5. Transforms objects into map frame.
+        6. Updates persistent object memory.
+        7. Infers global object edges.
+        8. Infers room clusters.
+        9. Saves and publishes the graph.
         """
 
         if self.latest_rgb is None:
@@ -132,8 +169,8 @@ class WorldSceneGraphNode(Node):
             self.get_logger().warn("No camera info yet.")
             return
 
-        if self.latest_pose is None:
-            self.get_logger().warn("No robot pose yet.")
+        if not self.update_robot_pose_from_tf():
+            self.get_logger().warn("No robot pose from TF yet.")
             return
 
         observed_graph = self.build_observed_graph(
@@ -145,7 +182,6 @@ class WorldSceneGraphNode(Node):
         self.update_world_memory(observed_graph)
 
         self.world_memory["edges"] = self.infer_world_edges()
-
         self.world_memory["rooms"] = self.infer_room_clusters()
 
         self.save_world_memory()
@@ -157,7 +193,7 @@ class WorldSceneGraphNode(Node):
         )
 
     def build_observed_graph(self, rgb_image, depth_image, camera_info):
-        """Build temporary graph from current camera frame."""
+        """Build a temporary observation graph from the current camera frame."""
 
         objects = self.detect_objects(rgb_image)
 
@@ -174,7 +210,7 @@ class WorldSceneGraphNode(Node):
         }
 
     def detect_objects(self, rgb_image):
-        """Run YOLO and return detected object nodes."""
+        """Run YOLO object detection."""
 
         results = self.model(rgb_image, verbose=False)[0]
         objects = []
@@ -209,7 +245,7 @@ class WorldSceneGraphNode(Node):
         return objects
 
     def estimate_camera_positions(self, objects, depth_image, camera_info):
-        """Estimate object 3D camera-frame positions from depth."""
+        """Estimate 3D object positions in camera frame using depth."""
 
         fx = camera_info.k[0]
         fy = camera_info.k[4]
@@ -244,7 +280,7 @@ class WorldSceneGraphNode(Node):
         return objects
 
     def get_stable_depth(self, depth_image, u, v, window_size=7):
-        """Return median valid depth near a pixel."""
+        """Use median depth around the center pixel to reduce noise."""
 
         h, w = depth_image.shape[:2]
         half = window_size // 2
@@ -270,7 +306,7 @@ class WorldSceneGraphNode(Node):
         return depth
 
     def transform_objects_to_map(self, objects):
-        """Transform detected object positions from camera frame to map frame."""
+        """Transform detected objects from camera frame into map frame."""
 
         for obj in objects:
             pos = obj["position_camera_frame"]
@@ -302,12 +338,14 @@ class WorldSceneGraphNode(Node):
                 }
 
             except Exception as e:
-                self.get_logger().warn(f"Could not transform object to map frame: {e}")
+                self.get_logger().warn(
+                    f"Could not transform object to map frame: {e}"
+                )
 
         return objects
 
     def update_world_memory(self, observed_graph):
-        """Merge current observations into persistent object memory."""
+        """Merge current detected objects into persistent memory."""
 
         now = time.time()
 
@@ -323,7 +361,7 @@ class WorldSceneGraphNode(Node):
                 self.update_world_object(match_id, obs, now)
 
     def find_matching_object(self, obs):
-        """Match observation to existing object by label and spatial distance."""
+        """Match an observation to an existing object by label and distance."""
 
         obs_label = obs["label"]
         obs_pos = obs["position_map_frame"]
@@ -350,7 +388,7 @@ class WorldSceneGraphNode(Node):
         return best_id
 
     def create_world_object(self, obs, now):
-        """Create a new remembered object."""
+        """Create a new persistent object."""
 
         obj_id = f"world_obj_{self.next_world_object_id}"
         self.next_world_object_id += 1
@@ -375,7 +413,7 @@ class WorldSceneGraphNode(Node):
         }
 
     def update_world_object(self, obj_id, obs, now):
-        """Update an existing remembered object with a new observation."""
+        """Update an existing persistent object."""
 
         obj = self.world_memory["objects"][obj_id]
 
@@ -405,11 +443,7 @@ class WorldSceneGraphNode(Node):
         obj["observations"] = obj["observations"][-10:]
 
     def infer_world_edges(self):
-        """
-        Infer global object-object relationships.
-
-        These edges are kept globally even though rooms are also inferred.
-        """
+        """Infer global object-object spatial relationships."""
 
         edges = []
         objects = list(self.world_memory["objects"].values())
@@ -459,12 +493,7 @@ class WorldSceneGraphNode(Node):
         return edges
 
     def infer_room_clusters(self):
-        """
-        Infer room-like subgraphs from tight object-object connections.
-
-        The room clustering uses only near edges.
-        Global object edges remain unchanged.
-        """
+        """Infer room-like clusters from tightly connected near edges."""
 
         objects = self.world_memory["objects"]
         edges = self.world_memory["edges"]
@@ -507,7 +536,7 @@ class WorldSceneGraphNode(Node):
         return rooms
 
     def find_connected_components(self, adjacency):
-        """Find connected components from object adjacency list."""
+        """Find connected components in an adjacency list."""
 
         visited = set()
         components = []
@@ -537,7 +566,7 @@ class WorldSceneGraphNode(Node):
         return components
 
     def compute_room_centroid(self, object_ids):
-        """Compute average map-frame x/y position of objects in a room."""
+        """Compute average x/y map position for a room cluster."""
 
         xs = []
         ys = []
@@ -563,7 +592,7 @@ class WorldSceneGraphNode(Node):
         }
 
     def get_edges_for_room(self, object_ids):
-        """Return all global edges whose source and target are inside the room."""
+        """Return all global edges whose source and target are inside a room."""
 
         object_set = set(object_ids)
         room_edges = []
@@ -575,20 +604,20 @@ class WorldSceneGraphNode(Node):
         return room_edges
 
     def publish_scene_graph(self):
-        """Publish the full graph with objects, edges, and rooms."""
+        """Publish full graph to ROS topic: scene_graph."""
 
         msg = String()
         msg.data = json.dumps(self.world_memory, indent=2)
         self.scene_graph_pub.publish(msg)
 
     def save_world_memory(self):
-        """Save graph to disk."""
+        """Save persistent graph to disk."""
 
         with open(self.memory_file, "w") as f:
             json.dump(self.world_memory, f, indent=2)
 
     def load_world_memory(self):
-        """Load graph from disk if it exists."""
+        """Load persistent graph from disk if available."""
 
         try:
             with open(self.memory_file, "r") as f:
@@ -626,6 +655,7 @@ class WorldSceneGraphNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
+
     node = WorldSceneGraphNode()
 
     try:
