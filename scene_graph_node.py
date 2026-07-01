@@ -40,18 +40,16 @@ class WorldSceneGraphNode(Node):
 
         self.update_period_sec = 3.0
         self.conf_threshold = 0.45
-        self.object_match_distance_m = 0.75
         self.near_threshold_m = 1.0
 
         self.memory_file = "world_scene_graph.json"
 
-        self.world_memory = {
-            "objects": {},
-            "edges": [],
-            "rooms": {}
+        self.scene_graph = {
+            "timestamp": None,
+            "robot_location": None,
+            "objects": [],
+            "relations": []
         }
-
-        self.next_world_object_id = 0
 
         self.model = YOLO("yolov8n.pt")
 
@@ -73,7 +71,7 @@ class WorldSceneGraphNode(Node):
             self.update_scene_graph
         )
 
-        self.load_world_memory()
+        self.load_scene_graph()
 
         self.get_logger().info("World scene graph node started.")
 
@@ -151,10 +149,8 @@ class WorldSceneGraphNode(Node):
         3. Detects objects.
         4. Estimates 3D object positions.
         5. Transforms objects into map frame.
-        6. Updates persistent object memory.
-        7. Infers global object edges.
-        8. Infers room clusters.
-        9. Saves and publishes the graph.
+        6. Logs only the currently observed objects and their relations.
+        7. Saves and publishes the graph.
         """
 
         if self.latest_rgb is None:
@@ -173,23 +169,28 @@ class WorldSceneGraphNode(Node):
             self.get_logger().warn("No robot pose from TF yet.")
             return
 
-        observed_graph = self.build_observed_graph(
+        objects = self.build_observed_graph(
             self.latest_rgb,
             self.latest_depth,
             self.camera_info
         )
 
-        self.update_world_memory(observed_graph)
+        relations = self.infer_observed_relations(objects)
 
-        self.world_memory["edges"] = self.infer_world_edges()
-        self.world_memory["rooms"] = self.infer_room_clusters()
+        self.scene_graph = {
+            "timestamp": time.time(),
+            "robot_location": self.latest_pose,
+            "objects": objects,
+            "relations": relations
+        }
 
-        self.save_world_memory()
+        self.save_scene_graph()
         self.publish_scene_graph()
+        self.log_observed_scene()
 
         self.get_logger().info(
-            f"Graph updated. Objects: {len(self.world_memory['objects'])}, "
-            f"Rooms: {len(self.world_memory['rooms'])}"
+            f"Scene graph updated. Objects: {len(objects)}, "
+            f"Relations: {len(relations)}"
         )
 
     def build_observed_graph(self, rgb_image, depth_image, camera_info):
@@ -205,9 +206,11 @@ class WorldSceneGraphNode(Node):
 
         objects = self.transform_objects_to_map(objects)
 
-        return {
-            "nodes": objects
-        }
+        return [
+            obj
+            for obj in objects
+            if obj["position_map_frame"] is not None
+        ]
 
     def detect_objects(self, rgb_image):
         """Run YOLO object detection."""
@@ -344,109 +347,10 @@ class WorldSceneGraphNode(Node):
 
         return objects
 
-    def update_world_memory(self, observed_graph):
-        """Merge current detected objects into persistent memory."""
+    def infer_observed_relations(self, objects):
+        """Infer spatial relationships between objects observed in this update."""
 
-        now = time.time()
-
-        for obs in observed_graph["nodes"]:
-            if obs["position_map_frame"] is None:
-                continue
-
-            match_id = self.find_matching_object(obs)
-
-            if match_id is None:
-                self.create_world_object(obs, now)
-            else:
-                self.update_world_object(match_id, obs, now)
-
-    def find_matching_object(self, obs):
-        """Match an observation to an existing object by label and distance."""
-
-        obs_label = obs["label"]
-        obs_pos = obs["position_map_frame"]
-
-        best_id = None
-        best_dist = float("inf")
-
-        for obj_id, obj in self.world_memory["objects"].items():
-            if obj["label"] != obs_label:
-                continue
-
-            obj_pos = obj["position_map_frame"]
-
-            dx = obs_pos["x"] - obj_pos["x"]
-            dy = obs_pos["y"] - obj_pos["y"]
-            dz = obs_pos.get("z", 0.0) - obj_pos.get("z", 0.0)
-
-            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-
-            if dist < self.object_match_distance_m and dist < best_dist:
-                best_dist = dist
-                best_id = obj_id
-
-        return best_id
-
-    def create_world_object(self, obs, now):
-        """Create a new persistent object."""
-
-        obj_id = f"world_obj_{self.next_world_object_id}"
-        self.next_world_object_id += 1
-
-        self.world_memory["objects"][obj_id] = {
-            "id": obj_id,
-            "label": obs["label"],
-            "confidence": obs["confidence"],
-            "position_map_frame": obs["position_map_frame"],
-            "first_seen": now,
-            "last_seen": now,
-            "times_seen": 1,
-            "room_id": None,
-            "observations": [
-                {
-                    "timestamp": now,
-                    "bbox": obs["bbox"],
-                    "confidence": obs["confidence"],
-                    "robot_location": self.latest_pose
-                }
-            ]
-        }
-
-    def update_world_object(self, obj_id, obs, now):
-        """Update an existing persistent object."""
-
-        obj = self.world_memory["objects"][obj_id]
-
-        old_pos = obj["position_map_frame"]
-        new_pos = obs["position_map_frame"]
-
-        alpha = 0.25
-
-        obj["position_map_frame"] = {
-            "x": (1 - alpha) * old_pos["x"] + alpha * new_pos["x"],
-            "y": (1 - alpha) * old_pos["y"] + alpha * new_pos["y"],
-            "z": (1 - alpha) * old_pos.get("z", 0.0) + alpha * new_pos.get("z", 0.0),
-            "frame_id": self.map_frame
-        }
-
-        obj["confidence"] = max(obj["confidence"], obs["confidence"])
-        obj["last_seen"] = now
-        obj["times_seen"] += 1
-
-        obj["observations"].append({
-            "timestamp": now,
-            "bbox": obs["bbox"],
-            "confidence": obs["confidence"],
-            "robot_location": self.latest_pose
-        })
-
-        obj["observations"] = obj["observations"][-10:]
-
-    def infer_world_edges(self):
-        """Infer global object-object spatial relationships."""
-
-        edges = []
-        objects = list(self.world_memory["objects"].values())
+        relations = []
 
         for i in range(len(objects)):
             for j in range(i + 1, len(objects)):
@@ -463,194 +367,134 @@ class WorldSceneGraphNode(Node):
                 dist = math.sqrt(dx * dx + dy * dy)
 
                 if dist < self.near_threshold_m:
-                    edges.append({
+                    relations.append({
                         "source": a["id"],
+                        "source_label": a["label"],
                         "relation": "near",
                         "target": b["id"],
+                        "target_label": b["label"],
                         "distance_m": float(dist)
                     })
-                    edges.append({
+                    relations.append({
                         "source": b["id"],
+                        "source_label": b["label"],
                         "relation": "near",
                         "target": a["id"],
+                        "target_label": a["label"],
                         "distance_m": float(dist)
                     })
 
-                if ax < bx:
-                    edges.append({"source": a["id"], "relation": "west_of", "target": b["id"]})
-                    edges.append({"source": b["id"], "relation": "east_of", "target": a["id"]})
-                else:
-                    edges.append({"source": a["id"], "relation": "east_of", "target": b["id"]})
-                    edges.append({"source": b["id"], "relation": "west_of", "target": a["id"]})
+                x_relation = "west_of" if ax < bx else "east_of"
+                inverse_x_relation = "east_of" if ax < bx else "west_of"
+                y_relation = "south_of" if ay < by else "north_of"
+                inverse_y_relation = "north_of" if ay < by else "south_of"
 
-                if ay < by:
-                    edges.append({"source": a["id"], "relation": "south_of", "target": b["id"]})
-                    edges.append({"source": b["id"], "relation": "north_of", "target": a["id"]})
-                else:
-                    edges.append({"source": a["id"], "relation": "north_of", "target": b["id"]})
-                    edges.append({"source": b["id"], "relation": "south_of", "target": a["id"]})
+                relations.append({
+                    "source": a["id"],
+                    "source_label": a["label"],
+                    "relation": x_relation,
+                    "target": b["id"],
+                    "target_label": b["label"],
+                    "distance_m": float(dist)
+                })
+                relations.append({
+                    "source": b["id"],
+                    "source_label": b["label"],
+                    "relation": inverse_x_relation,
+                    "target": a["id"],
+                    "target_label": a["label"],
+                    "distance_m": float(dist)
+                })
+                relations.append({
+                    "source": a["id"],
+                    "source_label": a["label"],
+                    "relation": y_relation,
+                    "target": b["id"],
+                    "target_label": b["label"],
+                    "distance_m": float(dist)
+                })
+                relations.append({
+                    "source": b["id"],
+                    "source_label": b["label"],
+                    "relation": inverse_y_relation,
+                    "target": a["id"],
+                    "target_label": a["label"],
+                    "distance_m": float(dist)
+                })
 
-        return edges
+        return relations
 
-    def infer_room_clusters(self):
-        """Infer room-like clusters from tightly connected near edges."""
+    def log_observed_scene(self):
+        """Log a compact human-readable version of the current observation."""
 
-        objects = self.world_memory["objects"]
-        edges = self.world_memory["edges"]
-
-        adjacency = {obj_id: [] for obj_id in objects.keys()}
-
-        for edge in edges:
-            if edge["relation"] != "near":
-                continue
-
-            source = edge["source"]
-            target = edge["target"]
-
-            if source in adjacency and target in adjacency:
-                adjacency[source].append(target)
-                adjacency[target].append(source)
-
-        components = self.find_connected_components(adjacency)
-
-        rooms = {}
-
-        for i, component in enumerate(components):
-            room_id = f"room_{i}"
-
-            centroid = self.compute_room_centroid(component)
-            room_edges = self.get_edges_for_room(component)
-
-            rooms[room_id] = {
-                "id": room_id,
-                "room_label": "unknown_room",
-                "object_ids": component,
-                "object_count": len(component),
-                "centroid": centroid,
-                "edges": room_edges
-            }
-
-            for obj_id in component:
-                self.world_memory["objects"][obj_id]["room_id"] = room_id
-
-        return rooms
-
-    def find_connected_components(self, adjacency):
-        """Find connected components in an adjacency list."""
-
-        visited = set()
-        components = []
-
-        for start_id in adjacency.keys():
-            if start_id in visited:
-                continue
-
-            stack = [start_id]
-            component = []
-
-            while stack:
-                current = stack.pop()
-
-                if current in visited:
-                    continue
-
-                visited.add(current)
-                component.append(current)
-
-                for neighbor in adjacency[current]:
-                    if neighbor not in visited:
-                        stack.append(neighbor)
-
-            components.append(component)
-
-        return components
-
-    def compute_room_centroid(self, object_ids):
-        """Compute average x/y map position for a room cluster."""
-
-        xs = []
-        ys = []
-
-        for obj_id in object_ids:
-            obj = self.world_memory["objects"][obj_id]
+        for obj in self.scene_graph["objects"]:
             pos = obj["position_map_frame"]
+            self.get_logger().info(
+                f"Observed {obj['label']} ({obj['id']}) at "
+                f"x={pos['x']:.2f}, y={pos['y']:.2f}, z={pos['z']:.2f} "
+                f"in {pos['frame_id']}"
+            )
 
-            xs.append(pos["x"])
-            ys.append(pos["y"])
-
-        if len(xs) == 0:
-            return {
-                "x": 0.0,
-                "y": 0.0,
-                "frame_id": self.map_frame
-            }
-
-        return {
-            "x": sum(xs) / len(xs),
-            "y": sum(ys) / len(ys),
-            "frame_id": self.map_frame
-        }
-
-    def get_edges_for_room(self, object_ids):
-        """Return all global edges whose source and target are inside a room."""
-
-        object_set = set(object_ids)
-        room_edges = []
-
-        for edge in self.world_memory["edges"]:
-            if edge["source"] in object_set and edge["target"] in object_set:
-                room_edges.append(edge)
-
-        return room_edges
+        for rel in self.scene_graph["relations"]:
+            self.get_logger().info(
+                f"Relation: {rel['source_label']} ({rel['source']}) "
+                f"{rel['relation']} {rel['target_label']} "
+                f"({rel['target']}) at {rel['distance_m']:.2f} m"
+            )
 
     def publish_scene_graph(self):
         """Publish full graph to ROS topic: scene_graph."""
 
         msg = String()
-        msg.data = json.dumps(self.world_memory, indent=2)
+        msg.data = json.dumps(self.scene_graph, indent=2)
         self.scene_graph_pub.publish(msg)
 
-    def save_world_memory(self):
-        """Save persistent graph to disk."""
+    def save_scene_graph(self):
+        """Save the latest observed scene graph to disk."""
 
         with open(self.memory_file, "w") as f:
-            json.dump(self.world_memory, f, indent=2)
+            json.dump(self.scene_graph, f, indent=2)
 
-    def load_world_memory(self):
-        """Load persistent graph from disk if available."""
+    def load_scene_graph(self):
+        """Load the most recent observed scene graph from disk if available."""
 
         try:
             with open(self.memory_file, "r") as f:
-                self.world_memory = json.load(f)
+                loaded_graph = json.load(f)
 
-            if "objects" not in self.world_memory:
-                self.world_memory["objects"] = {}
-            if "edges" not in self.world_memory:
-                self.world_memory["edges"] = []
-            if "rooms" not in self.world_memory:
-                self.world_memory["rooms"] = {}
-
-            max_id = -1
-
-            for obj_id in self.world_memory["objects"].keys():
-                try:
-                    number = int(obj_id.replace("world_obj_", ""))
-                    max_id = max(max_id, number)
-                except ValueError:
-                    pass
-
-            self.next_world_object_id = max_id + 1
+            self.scene_graph = {
+                "timestamp": loaded_graph.get("timestamp"),
+                "robot_location": loaded_graph.get("robot_location"),
+                "objects": self.normalize_loaded_objects(
+                    loaded_graph.get("objects", [])
+                ),
+                "relations": loaded_graph.get(
+                    "relations",
+                    loaded_graph.get("edges", [])
+                )
+            }
 
             self.get_logger().info(
-                f"Loaded memory: "
-                f"{len(self.world_memory['objects'])} objects, "
-                f"{len(self.world_memory['rooms'])} rooms."
+                f"Loaded latest scene graph: "
+                f"{len(self.scene_graph['objects'])} objects, "
+                f"{len(self.scene_graph['relations'])} relations."
             )
 
         except FileNotFoundError:
-            self.get_logger().info("No existing world memory file found.")
+            self.get_logger().info("No existing scene graph file found.")
         except Exception as e:
-            self.get_logger().warn(f"Could not load world memory: {e}")
+            self.get_logger().warn(f"Could not load scene graph: {e}")
+
+    def normalize_loaded_objects(self, objects):
+        """Accept old dict-based files, but keep the active schema as a list."""
+
+        if isinstance(objects, dict):
+            return list(objects.values())
+
+        if isinstance(objects, list):
+            return objects
+
+        return []
 
 
 def main(args=None):
